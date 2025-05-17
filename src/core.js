@@ -11,6 +11,10 @@ import {
   parseMetaDataMessage,
   processERReceived,
   processERSent,
+  processPMDeleteReceived,
+  processPMDeleteSent,
+  processPMEditReceived,
+  processPMEditSent,
   processPMReceived,
   processPMSent,
   reset,
@@ -97,6 +101,7 @@ export async function handleWebhook(request, ownerUid, botToken, secretToken, ch
 
   const update = await request.json();
   // --- for debugging ---
+  // TODO: 2025/5/10 don't forget to close
   // await postToTelegramApi(botToken, 'sendMessage', {
   //   chat_id: ownerUid,
   //   text: `DEBUG MESSAGE! update: ${JSON.stringify(update)}`,
@@ -104,14 +109,10 @@ export async function handleWebhook(request, ownerUid, botToken, secretToken, ch
   // --- for debugging ---
 
   if (update.edited_message) {
-    return new Response('OK');
-  }
-
-  if (update.message_reaction) {
     try {
-      // message_reaction EMOJI REACT(ER)
-      const messageReaction = update.message_reaction
-      const fromChat = messageReaction.chat;
+      const messageEdited = update.edited_message
+      const fromChat = messageEdited.chat;
+      const fromUser = messageEdited.from;
 
       const check = await doCheckInit(botToken, ownerUid)
       if (!check.failed) {
@@ -125,14 +126,14 @@ export async function handleWebhook(request, ownerUid, botToken, secretToken, ch
         if (false) {
           // ignore message types
           return new Response('OK');
-        } else if (messageReaction.user.id.toString() === ownerUid && fromChat.id === superGroupChatId
+        } else if (fromUser.id.toString() === ownerUid && fromChat.id === superGroupChatId
             && fromChat.is_forum) {
           // topic ER send to others.
-          await processERSent(botToken, messageReaction, topicToFromChat);
+          await processPMEditSent(botToken, messageEdited, superGroupChatId, topicToFromChat);
         } else {
           // topic ER receive from others.
           if (!bannedTopics.includes(fromChatToTopic.get(fromChat.id))) {
-            await processERReceived(botToken, ownerUid, messageReaction, superGroupChatId, bannedTopics);
+            await processPMEditReceived(botToken, ownerUid, messageEdited, superGroupChatId, fromChatToTopic, bannedTopics, metaDataMessage)
           }
         }
         return new Response('OK');
@@ -142,7 +143,50 @@ export async function handleWebhook(request, ownerUid, botToken, secretToken, ch
       // --- for debugging ---
       await postToTelegramApi(botToken, 'sendMessage', {
         chat_id: ownerUid,
-        text: `Error! You can send the message to developer for getting help : ${error.message} origin: ${JSON.stringify(update)}`,
+        text: `Error! You can send the message to developer for getting help : ${error.message} Stack: ${error.stack} origin: ${JSON.stringify(update)}`,
+      });
+      // --- for debugging ---
+      return new Response('OK');
+    }
+  }
+
+  if (update.message_reaction) {
+    try {
+      // message_reaction EMOJI REACT(ER)
+      const messageReaction = update.message_reaction
+      const fromChat = messageReaction.chat;
+      const fromUser = messageReaction.user;
+
+      const check = await doCheckInit(botToken, ownerUid)
+      if (!check.failed) {
+        const metaDataMessage = check.checkMetaDataMessageResp.result.pinned_message;
+        const {
+          superGroupChatId,
+          topicToFromChat,
+          fromChatToTopic,
+          bannedTopics
+        } = parseMetaDataMessage(metaDataMessage);
+        if (false) {
+          // ignore message types
+          return new Response('OK');
+        } else if (fromUser.id.toString() === ownerUid && fromChat.id === superGroupChatId
+            && fromChat.is_forum) {
+          // topic ER send to others.
+          await processERSent(botToken, messageReaction, topicToFromChat);
+        } else {
+          // topic ER receive from others.
+          if (!bannedTopics.includes(fromChatToTopic.get(fromChat.id))) {
+            await processERReceived(botToken, ownerUid, fromUser, messageReaction, superGroupChatId, bannedTopics);
+          }
+        }
+        return new Response('OK');
+      }
+      return new Response('OK');
+    } catch (error) {
+      // --- for debugging ---
+      await postToTelegramApi(botToken, 'sendMessage', {
+        chat_id: ownerUid,
+        text: `Error! You can send the message to developer for getting help : ${error.message} Stack: ${error.stack} origin: ${JSON.stringify(update)}`,
       });
       // --- for debugging ---
       return new Response('OK');
@@ -154,6 +198,7 @@ export async function handleWebhook(request, ownerUid, botToken, secretToken, ch
   }
   const message = update.message;
   const fromChat = message.chat;
+  const fromUser = message.from;
 
   if (childBotUrl) {
     // --- delivery children bots ---
@@ -161,63 +206,208 @@ export async function handleWebhook(request, ownerUid, botToken, secretToken, ch
   }
 
   // --- commands ---
-  if (message.from.id.toString() === ownerUid && fromChat.is_forum
-      && message.text.startsWith(".!") && message.text.endsWith("!.")) {
-    if (!message.is_topic_message) {
-      // --- commands in General topic ---
-      if (message.text === ".!pm_RUbot_checkInit!.") {
-        return await checkInit(botToken, ownerUid, message);
-      } else if (message.text === ".!pm_RUbot_doInit!.") {
-        return await init(botToken, ownerUid, message);
-      } else if (message.text === ".!pm_RUbot_doReset!.") {
-        return await reset(botToken, ownerUid, message, false);
+  try {
+    if (fromUser.id.toString() === ownerUid && fromChat.is_forum
+        && message.text?.startsWith(".!") && message.text?.endsWith("!.")) {
+      if (!message.is_topic_message) {
+        // --- commands in General topic ---
+        if (message.text === ".!pm_RUbot_checkInit!.") {
+          return await checkInit(botToken, ownerUid, message);
+        } else if (message.text === ".!pm_RUbot_doInit!.") {
+          return await init(botToken, ownerUid, message);
+        } else if (message.text === ".!pm_RUbot_doReset!.") {
+          return await reset(botToken, ownerUid, message, false);
+        }
+      } else {
+        // --- commands in PM topic ---
+        const check = await doCheckInit(botToken, ownerUid)
+        if (!check.failed) {
+          const metaDataMessage = check.checkMetaDataMessageResp.result.pinned_message;
+          const {
+            superGroupChatId,
+            topicToFromChat,
+            fromChatToTopic,
+            bannedTopics
+          } = parseMetaDataMessage(metaDataMessage);
+          if (fromChat.id !== superGroupChatId) {
+            await postToTelegramApi(botToken, 'sendMessage', {
+              chat_id: fromChat.id,
+              text: `Only can work in your PM super group`,
+            });
+            return new Response('OK');
+          }
+          if (message.text === (".!pm_RUbot_ban!.")) {
+            return await banTopic(botToken, ownerUid, message, topicToFromChat, metaDataMessage, false);
+          } else if (message.text === (".!pm_RUbot_unban!.")) {
+            return await unbanTopic(botToken, ownerUid, message, topicToFromChat, metaDataMessage, false);
+          } else if (message.text === (".!pm_RUbot_silent_ban!.")) {
+            return await banTopic(botToken, ownerUid, message, topicToFromChat, metaDataMessage, true);
+          } else if (message.text === (".!pm_RUbot_silent_unban!.")) {
+            return await unbanTopic(botToken, ownerUid, message, topicToFromChat, metaDataMessage, true);
+          }
+        }
       }
-    } else {
-      // --- commands in PM topic ---
-      const check = await doCheckInit(botToken, ownerUid)
-      if (!check.failed) {
-        const metaDataMessage = check.checkMetaDataMessageResp.result.pinned_message;
-        const {
-          superGroupChatId,
-          topicToFromChat,
-          fromChatToTopic,
-          bannedTopics
-        } = parseMetaDataMessage(metaDataMessage);
-        if (fromChat.id !== superGroupChatId) {
-          await postToTelegramApi(botToken, 'sendMessage', {
-            chat_id: fromChat.id,
-            text: `Only can work in your PM super group`,
-          });
-          return new Response('OK');
-        }
-        if (message.text === (".!pm_RUbot_ban!.")) {
-          return await banTopic(botToken, ownerUid, message, topicToFromChat, metaDataMessage, false);
-        } else if (message.text === (".!pm_RUbot_unban!.")) {
-          return await unbanTopic(botToken, ownerUid, message, topicToFromChat, metaDataMessage, false);
-        } else if (message.text === (".!pm_RUbot_silent_ban!.")) {
-          return await banTopic(botToken, ownerUid, message, topicToFromChat, metaDataMessage, true);
-        } else if (message.text === (".!pm_RUbot_silent_unban!.")) {
-          return await unbanTopic(botToken, ownerUid, message, topicToFromChat, metaDataMessage, true);
-        }
+      return new Response('OK');
+    } else if (fromUser.id.toString() === ownerUid && fromChat.id.toString() === ownerUid
+        && message.text?.startsWith(".!") && message.text?.endsWith("!.")) {
+      // --- commands in Owner Chat ---
+      if (message.text === ".!pm_RUbot_doReset!.") {
+        return await reset(botToken, ownerUid, message, true);
       }
     }
+  } catch (error) {
+    // --- for debugging ---
+    await postToTelegramApi(botToken, 'sendMessage', {
+      chat_id: ownerUid,
+      text: `Error! You can send the message to developer for getting help : ${error.message} Stack: ${error.stack} origin: ${JSON.stringify(update)}`,
+    });
+    // --- for debugging ---
     return new Response('OK');
-  } else if (message.from.id.toString() === ownerUid && fromChat.id.toString() === ownerUid
-      && message.text.startsWith(".!") && message.text.endsWith("!.")) {
-    // --- commands in Owner Chat ---
-    if (message.text === ".!pm_RUbot_doReset!.") {
-      return await reset(botToken, ownerUid, message, true);
-    }
   }
   // --- commands ---
 
-  const reply = message.reply_to_message;
   try {
     if ("/start" === message.text) {
-      // TODO: 2025/5/6 Introduction words for various scenarios
+      // Introduction words for various scenarios
+      let introduction = "*Welcome\\!*" +
+          "\n>I'm a PM bot\\." +
+          "\n>I'll forward your messages to my owner, and vice versa\\." +
+          "\n*There are some details below:*" +
+          "\n**>EMOJI REACTION:" +
+          "\n>  The emoji reaction 🕊 as seen below this message, indicates a successful forward\\." +
+          "\n>  If you don't see that, the message hasn't been forwarded\\." +
+          "\n>" +
+          "\n>  You can tap other emoji reaction for both your and my messages\\(except this one\\), and I'll forward it as well\\." +
+          "\n>  But as a bot, limited by TG, I can only send ONE FREE emoji reaction for each message\\." +
+          "\n>  So that if you're a tg\\-premium\\-user and tap many emoji reactions for one message\\. I'll only forward the last one if it's a free emoji\\.||" +
+          "\n**>EDIT MESSAGE:" +
+          "\n>  You can edit your message as usual, but ONLY TEXT message for now\\. " +
+          "If forward success, the emoji reaction 🦄 will swiftly appear and revert to 🕊 after about 1s\\." +
+          "\n>  If you don't see that, the EDITING hasn't been forwarded\\." +
+          "\n>  Perhaps you miss seeing that, you can try edit AGAIN with DIFFERENT CONTENT\\.||" +
+          "\n**>DELETE MESSAGE:" +
+          "\n>  You can delete your messages I forwarded by REPLYING the origin message and TYPING `#del` to me\\." +
+          " No additional process is needed\\." +
+          "\n>  But I can only delete my own messages, not yours\\. So, you need to delete the messages for yourself," +
+          " include \\[origin message\\] \\[command message\\] and \\[notify message\\]\\.||" +
+          "\n" +
+          "\n*If you want to see this message again,*" +
+          "\n*Send `/start` to me\\.*";
+      if (fromUser.id.toString() === ownerUid) {
+        // for owner only
+        introduction += "\n" +
+            "\n*The contents below are ONLY visible and valid for bot owner\\.*" +
+            "\n" +
+            "\n**>DELETE MESSAGE:" +
+            "\n>  I can delete both your messages and mine in the group since I have the necessary permissions\\." +
+            "\n" +
+            "\n*For Help*" +
+            "\nThis bot is totally *open source* and *free* to use\\. You can mail to *vivalavida@linux\\.do* for getting help\\. " +
+            "\nOr you can connect on [Linux Do](https://linux.do/t/topic/620510?u=ru_sirius)\\." +
+            "\n";
+        if (fromChat.is_forum && message.is_topic_message) {
+          // commands in PM topic
+          introduction +=
+              "\n*Commands in other places:*" +
+              "\nIn a personal chat with the bot:" +
+              "\n`.!pm_RUbot_doReset!.`" +
+              "\nIn the general topic of the PM chat super group:" +
+              "\n`.!pm_RUbot_checkInit!.`" +
+              "\n`.!pm_RUbot_doInit!.`" +
+              "\n`.!pm_RUbot_doReset!.`" +
+              "\n" +
+              "\n*Valid commands in here:*" +
+              "\n*BAN THIS TOPIC*" +
+              "\n➡️`.!pm_RUbot_ban!.`⬅️" +
+              "\n↗️*Press or Click to copy:*⬆️" +
+              "\n**>DESCRIPTION:" +
+              "\n>Block the topic where the command was sent," +
+              " stop forwarding messages from the corresponding chat," +
+              " and send a message to inform the other party that they have been banned\\.||" +
+              "\n➡️`.!pm_RUbot_unban!.`⬅️" +
+              "\n↗️*Press or Click to copy:*⬆️" +
+              "\n**>DESCRIPTION:" +
+              "\n>Unblock the topic where the command was sent," +
+              " and send a message to inform the other party that they have been unbanned\\.||" +
+              "\n➡️`.!pm_RUbot_silent_ban!.`⬅️" +
+              "\n↗️*Press or Click to copy:*⬆️" +
+              "\n**>DESCRIPTION:" +
+              "\n>Block the topic where the command was sent\\." +
+              " stop forwarding messages from the corresponding chat\\.||" +
+              "\n➡️`.!pm_RUbot_silent_unban!.`⬅️" +
+              "\n↗️*Press or Click to copy:*⬆️" +
+              "\n**>DESCRIPTION:" +
+              "\n>Unblock the topic where the command was sent\\.||";
+        } else if (fromChat.is_forum) {
+          // commands in General topic
+          introduction +=
+              "\n*Commands in other places:*" +
+              "\nIn a personal chat with the bot:" +
+              "\n`.!pm_RUbot_doReset!.`" +
+              "\nIn the corresponding PM chat Topic:" +
+              "\n`.!pm_RUbot_ban!.`" +
+              "\n`.!pm_RUbot_unban!.`" +
+              "\n`.!pm_RUbot_silent_ban!.`" +
+              "\n`.!pm_RUbot_silent_unban!.`" +
+              "\n" +
+              "\n*Valid commands in here:*" +
+              "\n➡️`.!pm_RUbot_checkInit!.`⬅️" +
+              "\n↗️*Press or Click to copy:*⬆️" +
+              "\n>Check the initialization status, and the result reply is in the personal chat with the robot\\." +
+              "\n➡️`.!pm_RUbot_doInit!.`⬅️" +
+              "\n↗️*Press or Click to copy:*⬆️" +
+              "\n>Perform initial settings, and the result reply is in the personal chat with the robot\\." +
+              "\n➡️`.!pm_RUbot_doReset!.`⬅️" +
+              "\n↗️*Press or Click to copy:*⬆️" +
+              "\n>Reset the settings, and the result reply is in the personal chat with the robot\\." +
+              "\n";
+        } else {
+          // commands in bot chat
+          introduction +=
+              "\n*Commands in other places:*" +
+              "\nIn the general topic of the PM chat super group:" +
+              "\n`.!pm_RUbot_checkInit!.`" +
+              "\n`.!pm_RUbot_doInit!.`" +
+              "\n`.!pm_RUbot_doReset!.`" +
+              "\nIn the corresponding PM chat Topic:" +
+              "\n`.!pm_RUbot_ban!.`" +
+              "\n`.!pm_RUbot_unban!.`" +
+              "\n`.!pm_RUbot_silent_ban!.`" +
+              "\n`.!pm_RUbot_silent_unban!.`" +
+              "\n " +
+              "\n*Valid commands in here:*" +
+              "\n➡️`.!pm_RUbot_doReset!.`⬅️" +
+              "\n↗️*Press or Click to copy:*⬆️" +
+              "\n>Reset the settings\\." +
+              "\n";
+        }
+      }
+      const sendMessageResp = await (await postToTelegramApi(botToken, 'sendMessage', {
+        chat_id: fromChat.id,
+        text: introduction,
+        message_thread_id: message.message_thread_id,
+        parse_mode: "MarkdownV2",
+        link_preview_options: { is_disabled: true },
+      })).json();
+      if (sendMessageResp.ok) {
+        await postToTelegramApi(botToken, 'setMessageReaction', {
+          chat_id: fromChat.id,
+          message_id: sendMessageResp.result.message_id,
+          reaction: [{ type: "emoji", emoji: "🕊" }]
+        });
+      } else {
+        // TODO: 2025/5/9 for parse_mode test
+        await postToTelegramApi(botToken, 'sendMessage', {
+          chat_id: fromChat.id,
+          message_thread_id: message.message_thread_id,
+          text: `resp: ${JSON.stringify(sendMessageResp)}`,
+        })
+      }
       return new Response('OK');
     }
 
+
+    const reply = message.reply_to_message;
     const check = await doCheckInit(botToken, ownerUid)
     if (!check.failed) {
       const metaDataMessage = check.checkMetaDataMessageResp.result.pinned_message;
@@ -230,13 +420,25 @@ export async function handleWebhook(request, ownerUid, botToken, secretToken, ch
       if (message.forum_topic_created || message.pinned_message) {
         // ignore message types
         return new Response('OK');
-      } else if (message.from.id.toString() === ownerUid && fromChat.id === superGroupChatId
+      } else if (fromUser.id.toString() === ownerUid && fromChat.id === superGroupChatId
           && fromChat.is_forum && message.is_topic_message) {
-        // topic PM send to others
-        await processPMSent(botToken, message, topicToFromChat);
+        if (message.text === "#del" && reply?.message_id && reply?.from.id === fromUser.id && reply?.message_id !== message.message_thread_id) {
+          // delete message
+          await processPMDeleteSent(botToken, message, reply, superGroupChatId, topicToFromChat);
+        } else {
+          // topic PM send to others
+          await processPMSent(botToken, message, topicToFromChat);
+        }
       } else {
-        // topic PM receive from others. Always receive first.
-        await processPMReceived(botToken, ownerUid, message, superGroupChatId, fromChatToTopic, bannedTopics, metaDataMessage);
+        if (message.text === "#del" && reply?.message_id && reply?.from.id === fromUser.id) {
+          // delete message
+          if (!bannedTopics.includes(fromChatToTopic.get(fromChat.id))) {
+            await processPMDeleteReceived(botToken, ownerUid, message, reply, superGroupChatId, fromChatToTopic, bannedTopics, metaDataMessage);
+          }
+        } else {
+          // topic PM receive from others. Always receive first.
+          await processPMReceived(botToken, ownerUid, message, superGroupChatId, fromChatToTopic, bannedTopics, metaDataMessage);
+        }
       }
       return new Response('OK');
     }
@@ -292,7 +494,7 @@ export async function handleWebhook(request, ownerUid, botToken, secretToken, ch
     // --- for debugging ---
     await postToTelegramApi(botToken, 'sendMessage', {
       chat_id: ownerUid,
-      text: `Error! You can send the message to developer for getting help : ${error.message} origin: ${JSON.stringify(update)}`,
+      text: `Error! You can send the message to developer for getting help : ${error.message} Stack: ${error.stack} origin: ${JSON.stringify(update)}`,
     });
     // --- for debugging ---
     return new Response('OK');

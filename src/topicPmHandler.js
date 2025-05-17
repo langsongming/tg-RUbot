@@ -35,7 +35,7 @@ export async function motherBotCommands(botToken, ownerUid, message, childBotUrl
     } else {
       await postToTelegramApi(botToken, 'sendMessage', {
         chat_id: message.chat.id,
-        text: `has no this command! Try '/install {{botToken}}' OR '/uninstall {{botToken}}'`,
+        text: `Has no this command! Try '/install {{botToken}}' OR '/uninstall {{botToken}}'`,
       });
     }
     return new Response('OK');
@@ -170,6 +170,7 @@ export function parseMetaDataMessage(metaDataMessage) {
     for (let i = 1; i < metaDataSplit.length; i++) {
       const topicToFromChatSplit = metaDataSplit[i].split(":");
       const topic = parseInt(topicToFromChatSplit[0]);
+      if (!topic) continue
       let fromChat;
       if (topicToFromChatSplit[1].startsWith('b')) {
         bannedTopics.push(topic);
@@ -186,27 +187,34 @@ export function parseMetaDataMessage(metaDataMessage) {
 
 async function addTopicToFromChatOnMetaData(botToken, metaDataMessage, ownerUid, topicId, fromChatId) {
   const newText = `${metaDataMessage.text};${topicId}:${fromChatId}`
-  await postToTelegramApi(botToken, 'editMessageText', {
-    chat_id: ownerUid,
-    message_id: metaDataMessage.message_id,
-    text: newText,
-  });
-  return { messageText: newText };
+  return await editMetaDataMessage(botToken, ownerUid, metaDataMessage, newText);
 }
 
 async function cleanItemOnMetaData(botToken, metaDataMessage, ownerUid, topicId) {
   const oldText = metaDataMessage.text;
   let itemStartIndex = oldText.indexOf(`;${topicId}:`) + 1;
+  if (itemStartIndex === 0) return { messageText: oldText };
   let itemEndIndex = oldText.indexOf(';', itemStartIndex);
   let newText = itemEndIndex === -1 ? oldText.substring(0, itemStartIndex - 1)
       : oldText.replace(oldText.substring(itemStartIndex, itemEndIndex + 1), '');
-  await postToTelegramApi(botToken, 'editMessageText', {
+  return await editMetaDataMessage(botToken, ownerUid, metaDataMessage, newText);
+}
+
+async function editMetaDataMessage(botToken, ownerUid, metaDataMessage, newText) {
+  // TODO: 2025/5/10 MAX LENGTH 4096
+  const editMessageTextResp = await (await postToTelegramApi(botToken, 'editMessageText', {
     chat_id: ownerUid,
     message_id: metaDataMessage.message_id,
     text: newText,
-  });
-  metaDataMessage.text = newText;
-  return { messageText: newText };
+  })).json();
+  if (!editMessageTextResp.ok) {
+    await postToTelegramApi(botToken, 'sendMessage', {
+      chat_id: ownerUid,
+      text: `editMetaDataMessage: editMessageTextResp: ${JSON.stringify(editMessageTextResp)}`,
+    });
+  }
+  metaDataMessage.text = editMessageTextResp.result.text;
+  return { messageText: editMessageTextResp.result.text };
 }
 
 async function banTopicOnMetaData(botToken, ownerUid, metaDataMessage, topicId) {
@@ -268,6 +276,7 @@ export async function reset(botToken, ownerUid, message, inOwnerChat) {
           text: `Can't reset from group isn't current using!`,
         });
       }
+      return new Response('OK');
     } else {
       await postToTelegramApi(botToken, 'sendMessage', {
         chat_id: ownerUid,
@@ -295,50 +304,58 @@ export async function processPMReceived(botToken, ownerUid, message, superGroupC
   const pmMessageId = message.message_id;
   let topicId = fromChatToTopic.get(fromChatId);
   let isNewTopic = false;
-  let fromChatName
-  if (!topicId) {
-    fromChatName = fromChat.username ?
-        `@${fromChat.username}` : [fromChat.first_name, fromChat.last_name].filter(Boolean).join(' ');
-    let topicName = `${fromChatName} ${fromChatId === message.from.id ? `(${fromChatId})` : `(${fromChatId})(${message.from.id})`}`
-    const lengthCheckDo = function (topicName, newTopicName) {
-      if (topicName.length > 128) {
-        return newTopicName;
-      } else {
-        return topicName
-      }
+
+  const fromChatName = fromChat.username ?
+      `@${fromChat.username}` : [fromChat.first_name, fromChat.last_name].filter(Boolean).join(' ');
+  let topicName = `${fromChatName} ${fromChatId === message.from.id ? `(${fromChatId})` : `(${fromChatId})(${message.from.id})`}`
+  const lengthCheckDo = function (topicName, newTopicName) {
+    if (topicName.length > 128) {
+      return newTopicName;
+    } else {
+      return topicName;
     }
-    topicName = lengthCheckDo(topicName, `${fromChatName} (${fromChatId})`);
-    topicName = lengthCheckDo(topicName, fromChatName);
-    topicName = lengthCheckDo(topicName, fromChatName.substring(0, 127));
+  }
+  topicName = lengthCheckDo(topicName, `${fromChatName} (${fromChatId})`);
+  topicName = lengthCheckDo(topicName, fromChatName);
+  topicName = lengthCheckDo(topicName, fromChatName.substring(0, 127));
+
+  if (!topicId) {
     const createTopicResp = await (await postToTelegramApi(botToken, 'createForumTopic', {
       chat_id: superGroupChatId,
       name: topicName,
     })).json();
     topicId = createTopicResp.result?.message_thread_id
+    if (!createTopicResp.ok || !topicId) {
+      await postToTelegramApi(botToken, 'sendMessage', {
+        chat_id: ownerUid,
+        text: `DEBUG MESSAGE! chatId: ${superGroupChatId} topicName: ${topicName} createTopicResp: ${JSON.stringify(createTopicResp)}`,
+      });
+      return;
+    }
     await addTopicToFromChatOnMetaData(botToken, metaDataMessage, ownerUid, topicId, fromChatId);
     isNewTopic = true;
   }
 
   const isTopicExists = await (async function () {
-    const reopenForumTopicResp = await (await postToTelegramApi(botToken, 'reopenForumTopic', {
+    const reopenForumTopicResp = await (await postToTelegramApi(botToken, 'editForumTopic', {
       chat_id: superGroupChatId,
       message_thread_id: topicId,
+      name: topicName,
     })).json();
     return reopenForumTopicResp.ok || !reopenForumTopicResp.description.includes("TOPIC_ID_INVALID");
   })()
 
   // topic has been banned
   if (bannedTopics.includes(topicId) && isTopicExists) {
-    return
+    return { success: false }
   }
 
   if (!isTopicExists) {
     // clean metadata message
     await cleanItemOnMetaData(botToken, metaDataMessage, ownerUid, topicId);
-    fromChatToTopic.delete(topicId)
+    fromChatToTopic.delete(fromChatId)
     // resend the message
-    await processPMReceived(botToken, ownerUid, message, superGroupChatId, fromChatToTopic, bannedTopics, metaDataMessage)
-    return
+    return await processPMReceived(botToken, ownerUid, message, superGroupChatId, fromChatToTopic, bannedTopics, metaDataMessage)
   }
 
   // forwardMessage to topic
@@ -356,12 +373,29 @@ export async function processPMReceived(botToken, ownerUid, message, superGroupC
       if (superGroupChatId.toString().startsWith("-100")) {
         messageLink = `https://t.me/c/${superGroupChatId.toString().substring(4)}/${topicId}/${topicMessageId}`
       }
-      await postToTelegramApi(botToken, 'sendMessage', {
+      const text = `${messageLink
+          ? `New PM chat from ${fromChatName.replaceAll("(", "\\(")
+              .replaceAll(")", "\\)")
+              .replaceAll("-", "\\-")}` +
+          `\n[Click the to view it in your SUPERGROUP](${messageLink})`
+          : `New PM chat from ${fromChatName.replaceAll("(", "\\(")
+              .replaceAll(")", "\\)")
+              .replaceAll("-", "\\-")}` +
+          `\nGo view it in your SUPERGROUP`}`
+      const sendMessageResp = await (await postToTelegramApi(botToken, 'sendMessage', {
         chat_id: ownerUid,
-        text: `${messageLink
-            ? `New PM chat from ${fromChatName}.\nClick the link below to view it in your PM_SUPERGROUP:\n${messageLink}`
-            : `New PM chat from ${fromChatName}, Go view it in your PM_SUPERGROUP`}`,
-      });
+        text: text,
+        parse_mode: "MarkdownV2",
+        link_preview_options: { is_disabled: true },
+      })).json();
+      if (!sendMessageResp.ok) {
+        // TODO: 2025/5/9 for parse_mode test
+        await postToTelegramApi(botToken, 'sendMessage', {
+          chat_id: fromChat.id,
+          message_thread_id: message.message_thread_id,
+          text: `text: ${text} resp: ${JSON.stringify(sendMessageResp)}`,
+        })
+      }
     }
     // save messageId connection to superGroupChat pin message
     await saveMessageConnection(botToken, superGroupChatId, topicId, topicMessageId, pmMessageId, ownerUid);
@@ -371,13 +405,22 @@ export async function processPMReceived(botToken, ownerUid, message, superGroupC
       message_id: pmMessageId,
       reaction: [{ type: "emoji", emoji: "🕊" }]
     });
+    return {
+      success: true,
+      targetChatId: superGroupChatId,
+      targetTopicId: topicId,
+      originChatId: fromChatId,
+      originMessageId: pmMessageId,
+      newMessageId: topicMessageId
+    }
   } else if (forwardMessageResp.description.includes('message thread not found')) {
     // clean metadata message
     await cleanItemOnMetaData(botToken, metaDataMessage, ownerUid, topicId);
-    fromChatToTopic.delete(topicId)
+    fromChatToTopic.delete(fromChatId)
     // resend the message
-    await processPMReceived(botToken, ownerUid, message, superGroupChatId, fromChatToTopic, bannedTopics, metaDataMessage)
+    return await processPMReceived(botToken, ownerUid, message, superGroupChatId, fromChatToTopic, bannedTopics, metaDataMessage)
   }
+  return { success: false }
 }
 
 export async function processPMSent(botToken, message, topicToFromChat) {
@@ -400,6 +443,11 @@ export async function processPMSent(botToken, message, topicToFromChat) {
       chat_id: superGroupChatId,
       message_id: topicMessageId,
       reaction: [{ type: "emoji", emoji: "🕊" }]
+    });
+  } else {
+    await postToTelegramApi(botToken, 'sendMessage', {
+      chat_id: ownerUid,
+      text: `SEND MESSAGE ERROR! copyMessageResp: ${JSON.stringify(copyMessageResp)} message: ${JSON.stringify(message)}`,
     });
   }
 }
@@ -426,12 +474,12 @@ async function checkMessageConnectionMetaData(botToken, superGroupChatId, failed
   return { failedMessage, failed, metaDataMessageId, metaDataMessageText, metaDataMessage };
 }
 
-async function checkMessageConnectionMetaDataForAction(botToken, superGroupChatId, failedMessage, ownerUid) {
+async function checkMessageConnectionMetaDataForAction(botToken, superGroupChatId, failedMessage, failedMessageChatId) {
   const checkMessageConnectionMetaDataResp = await checkMessageConnectionMetaData(
       botToken, superGroupChatId, failedMessage);
   if (checkMessageConnectionMetaDataResp.failed) {
     await postToTelegramApi(botToken, 'sendMessage', {
-      chat_id: ownerUid,
+      chat_id: failedMessageChatId,
       text: failedMessage,
     });
   }
@@ -503,7 +551,7 @@ async function saveMessageConnection(botToken, superGroupChatId, topicId, topicM
 
 // ---------------------------------------- EMOJI REACTION ----------------------------------------
 
-export async function processERReceived(botToken, ownerUid, messageReaction, superGroupChatId, bannedTopics) {
+export async function processERReceived(botToken, ownerUid, fromUser, messageReaction, superGroupChatId, bannedTopics) {
   const pmMessageId = messageReaction.message_id;
   let topicId;
   let topicMessageId;
@@ -531,7 +579,7 @@ export async function processERReceived(botToken, ownerUid, messageReaction, sup
     return;
   }
 
-  if (reaction.length === 0) {
+  if (reaction.length === 0 && fromUser.id === ownerUid) {
     reaction = [
       {
         "type": "emoji",
@@ -573,6 +621,7 @@ export async function processERSent(botToken, messageReaction, topicToFromChat) 
     return;
   }
 
+  // TODO: 2025/5/10 if react on owner's message, there's no need for a 🕊
   if (reaction.length === 0) {
     reaction = [
       {
@@ -607,6 +656,293 @@ async function sendEmojiReaction(botToken, targetChatId, targetMessageId, reacti
       // });
       // --- for debugging ---
     }
+  }
+}
+
+// ---------------------------------------- EDIT MESSAGE ----------------------------------------
+
+export async function processPMEditReceived(botToken, ownerUid, message, superGroupChatId, fromChatToTopic, bannedTopics, metaDataMessage) {
+  const { success: isForwardSuccess, targetChatId, targetTopicId, originChatId, originMessageId, newMessageId } =
+      await processPMReceived(botToken, ownerUid, message, superGroupChatId, fromChatToTopic, bannedTopics, metaDataMessage)
+  if (isForwardSuccess) {
+    const checkMessageConnectionMetaDataResp =
+        await checkMessageConnectionMetaDataForAction(botToken, superGroupChatId,
+            `Can't find ORIGIN message for message EDITING.`, ownerUid);
+
+    let newMessageLink = `https://t.me/c/${targetChatId}/${targetTopicId}/${newMessageId}`;
+    if (targetChatId.toString().startsWith("-100")) {
+      newMessageLink = `https://t.me/c/${targetChatId.toString().substring(4)}/${targetTopicId}/${newMessageId}`;
+    }
+
+    let oldMessageId;
+    let oldMessageLink;
+    const messageConnectionTextSplit = checkMessageConnectionMetaDataResp.metaDataMessageText?.split(';');
+    if (messageConnectionTextSplit) {
+      for (let i = 0; i < messageConnectionTextSplit.length; i++) {
+        const messageConnectionTextSplitSplit = messageConnectionTextSplit[i].split(':');
+        if (originMessageId === parseInt(messageConnectionTextSplitSplit[1])) {
+          const topicMessageMetaData = messageConnectionTextSplitSplit[0];
+          const topicMessageMetaDataSplit = topicMessageMetaData.split('-');
+          oldMessageId = parseInt(topicMessageMetaDataSplit[1]);
+          break;
+        }
+      }
+      oldMessageLink = oldMessageId ? `https://t.me/c/${targetChatId}/${targetTopicId}/${oldMessageId}` : '';
+      if (oldMessageId && targetChatId.toString().startsWith("-100")) {
+        oldMessageLink = `https://t.me/c/${targetChatId.toString().substring(4)}/${targetTopicId}/${oldMessageId}`;
+      }
+    }
+
+    let text = `⬆️⬆️⬆️⬆️⬆️⬆️`;
+    if (oldMessageLink) {
+      text += `\n*[Message](${newMessageLink}) edited from [MESSAGE](${oldMessageLink})*`;
+    } else {
+      text += `\n*[Message](${newMessageLink}) edited from unknown*`;
+    }
+    await postToTelegramApi(botToken, 'sendMessage', {
+      chat_id: targetChatId,
+      message_thread_id: targetTopicId,
+      text: text,
+      parse_mode: "MarkdownV2",
+    });
+    await notifyMessageEditForward(botToken, originChatId, originMessageId);
+  }
+}
+
+export async function processPMEditSent(botToken, message, superGroupChatId, topicToFromChat) {
+  const ownerUid = message.from.id;
+  const topicId = message.message_thread_id;
+  const topicMessageId = message.message_id;
+  const pmChatId = topicToFromChat.get(message.message_thread_id);
+  let pmMessageId;
+
+  const checkMessageConnectionMetaDataResp =
+      await checkMessageConnectionMetaDataForAction(botToken, superGroupChatId,
+          `Can't find TARGET message for sent message editing.`, ownerUid);
+  if (checkMessageConnectionMetaDataResp.failed) return;
+
+  const messageConnectionTextSplit = checkMessageConnectionMetaDataResp.metaDataMessageText.split(';').reverse();
+  for (let i = 0; i < messageConnectionTextSplit.length; i++) {
+    const messageConnectionTextSplitSplit = messageConnectionTextSplit[i].split(':');
+    const topicMessageMetaData = messageConnectionTextSplitSplit[0];
+    const topicMessageMetaDataSplit = topicMessageMetaData.split('-');
+    if (topicMessageId === parseInt(topicMessageMetaDataSplit[1])) {
+      pmMessageId = messageConnectionTextSplitSplit[1];
+      break;
+    }
+  }
+
+  let oldMessageLink = `https://t.me/c/${superGroupChatId}/${topicId}/${topicMessageId}`;
+  if (superGroupChatId.toString().startsWith("-100")) {
+    oldMessageLink = `https://t.me/c/${superGroupChatId.toString().substring(4)}/${topicId}/${topicMessageId}`;
+  }
+  if (!pmMessageId) {
+    await postToTelegramApi(botToken, 'sendMessage', {
+      chat_id: superGroupChatId,
+      message_thread_id: topicId,
+      text: `Can't find TARGET message for sent [message](${oldMessageLink}) EDITING\\.`,
+      parse_mode: "MarkdownV2",
+    });
+    return;
+  }
+
+  if (message.text) {
+    const editMessageTextResp = await (await postToTelegramApi(botToken, 'editMessageText', {
+      chat_id: pmChatId,
+      message_id: pmMessageId,
+      text: message.text,
+      parse_mode: message.parse_mode,
+      entities: message.entities,
+    })).json();
+    if (editMessageTextResp.ok) {
+      // notify sending status by MessageReaction
+      await notifyMessageEditForward(botToken, superGroupChatId, topicMessageId);
+    } else {
+      await postToTelegramApi(botToken, 'sendMessage', {
+        chat_id: ownerUid,
+        text: `SEND EDITED MESSAGE ERROR! editMessageTextResp: ${JSON.stringify(editMessageTextResp)} message: ${JSON.stringify(message)}.` +
+            `\nYou can send this to developer for getting help, or just delete this message.`,
+      });
+    }
+  } else if (false) {
+    // TODO: 2025/5/10 editMessageCaption
+  } else if (false) {
+    // TODO: 2025/5/10 editMessageMedia
+  } else if (false) {
+    // TODO: 2025/5/10 editMessageLiveLocation
+  } else if (false) {
+    // TODO: 2025/5/10 stopMessageLiveLocation
+  }
+}
+
+async function notifyMessageEditForward(botToken, fromChatId, fromMessageId) {
+  await postToTelegramApi(botToken, 'setMessageReaction', {
+    chat_id: fromChatId,
+    message_id: fromMessageId,
+    reaction: [{ type: "emoji", emoji: "🦄" }]
+  });
+  await new Promise(resolve => setTimeout(resolve, 1000));
+  await postToTelegramApi(botToken, 'setMessageReaction', {
+    chat_id: fromChatId,
+    message_id: fromMessageId,
+    reaction: [{ type: "emoji", emoji: "🕊" }]
+  });
+}
+
+// ---------------------------------------- DELETE MESSAGE ----------------------------------------
+
+export async function processPMDeleteReceived(botToken, ownerUid, message, reply,
+                                              superGroupChatId, fromChatToTopic, bannedTopics, metaDataMessage) {
+  const commandMessageId = message.message_id;
+  const targetChatId = superGroupChatId;
+  const originMessageId = reply.message_id;
+  const fromChat = message.chat;
+  const fromChatId = fromChat.id;
+
+  const checkMessageConnectionMetaDataResp =
+      await checkMessageConnectionMetaDataForAction(botToken, superGroupChatId,
+          `Can't find ORIGIN message for message DELETING.`, ownerUid);
+
+  let targetMessageId;
+  const messageConnectionTextSplit = checkMessageConnectionMetaDataResp.metaDataMessageText?.split(';');
+  if (messageConnectionTextSplit) {
+    for (let i = 0; i < messageConnectionTextSplit.length; i++) {
+      const messageConnectionTextSplitSplit = messageConnectionTextSplit[i].split(':');
+      if (originMessageId === parseInt(messageConnectionTextSplitSplit[1])) {
+        const topicMessageMetaData = messageConnectionTextSplitSplit[0];
+        const topicMessageMetaDataSplit = topicMessageMetaData.split('-');
+        targetMessageId = parseInt(topicMessageMetaDataSplit[1]);
+        break;
+      }
+    }
+  }
+
+  if (message.text) {
+    const deleteMessageResp = await (await postToTelegramApi(botToken, 'deleteMessage', {
+      chat_id: targetChatId,
+      message_id: targetMessageId,
+    })).json();
+    if (deleteMessageResp.ok) {
+      await notifyMessageDeleteForward(botToken, fromChatId, originMessageId, commandMessageId);
+    } else {
+      await postToTelegramApi(botToken, 'sendMessage', {
+        chat_id: fromChatId,
+        text: `SEND DELETING MESSAGE ERROR! deleteMessageResp: ${JSON.stringify(deleteMessageResp)} message: ${JSON.stringify(message)}.` +
+            `\nYou can send this to developer for getting help, or just delete this message.`,
+      });
+    }
+  }
+}
+
+export async function processPMDeleteSent(botToken, message, reply, superGroupChatId, topicToFromChat) {
+  const ownerUid = message.from.id;
+  const commandMessageId = message.message_id;
+  const topicId = message.message_thread_id;
+  const deleteOriginMessageId = reply.message_id;
+  const pmChatId = topicToFromChat.get(message.message_thread_id);
+  let deleteTargetMessageId;
+
+  const checkMessageConnectionMetaDataResp =
+      await checkMessageConnectionMetaDataForAction(botToken, superGroupChatId,
+          `Can't find TARGET message for sent message DELETING.`, ownerUid);
+  if (checkMessageConnectionMetaDataResp.failed) return;
+
+  const messageConnectionTextSplit = checkMessageConnectionMetaDataResp.metaDataMessageText.split(';').reverse();
+  for (let i = 0; i < messageConnectionTextSplit.length; i++) {
+    const messageConnectionTextSplitSplit = messageConnectionTextSplit[i].split(':');
+    const topicMessageMetaData = messageConnectionTextSplitSplit[0];
+    const topicMessageMetaDataSplit = topicMessageMetaData.split('-');
+    if (deleteOriginMessageId === parseInt(topicMessageMetaDataSplit[1])) {
+      deleteTargetMessageId = messageConnectionTextSplitSplit[1];
+      break;
+    }
+  }
+
+  let originMessageLink = `https://t.me/c/${superGroupChatId}/${topicId}/${deleteOriginMessageId}`;
+  if (superGroupChatId.toString().startsWith("-100")) {
+    originMessageLink = `https://t.me/c/${superGroupChatId.toString().substring(4)}/${topicId}/${deleteOriginMessageId}`;
+  }
+  if (!deleteTargetMessageId) {
+    await postToTelegramApi(botToken, 'sendMessage', {
+      chat_id: superGroupChatId,
+      message_thread_id: topicId,
+      text: `Can't find TARGET message for sent [message](${originMessageLink}) DELETING\\.`,
+      parse_mode: "MarkdownV2",
+    });
+    return;
+  }
+
+  if (message.text) {
+    const deleteMessageResp = await (await postToTelegramApi(botToken, 'deleteMessage', {
+      chat_id: pmChatId,
+      message_id: deleteTargetMessageId,
+    })).json();
+    if (deleteMessageResp.ok) {
+      await notifyMessageDeleteForward(botToken, superGroupChatId, deleteOriginMessageId, commandMessageId, topicId);
+    } else {
+      await postToTelegramApi(botToken, 'sendMessage', {
+        chat_id: superGroupChatId,
+        message_thread_id: topicId,
+        text: `SEND DELETING MESSAGE ERROR! deleteMessageResp: ${JSON.stringify(deleteMessageResp)} message: ${JSON.stringify(message)}.` +
+            `\nYou can send this to developer for getting help, or just delete this message.`,
+      });
+    }
+  }
+}
+
+async function notifyMessageDeleteForward(botToken, fromChatId, fromMessageId, commandMessageId, fromTopicId) {
+  await postToTelegramApi(botToken, 'setMessageReaction', {
+    chat_id: fromChatId,
+    message_id: commandMessageId,
+    reaction: [{ type: "emoji", emoji: "🗿" }]
+  });
+  if (fromTopicId) {
+    let originMessageLink = `https://t.me/c/${fromChatId}/${fromTopicId ? `${fromTopicId}/` : ''}${fromMessageId}`;
+    if (fromChatId.toString().startsWith("-100")) {
+      originMessageLink = `https://t.me/c/${fromChatId.toString().substring(4)}/${fromTopicId ? `${fromTopicId}/` : ''}${fromMessageId}`;
+    }
+    let commandMessageLink = `https://t.me/c/${fromChatId}/${fromTopicId ? `${fromTopicId}/` : ''}${commandMessageId}`;
+    if (fromChatId.toString().startsWith("-100")) {
+      commandMessageLink = `https://t.me/c/${fromChatId.toString().substring(4)}/${fromTopicId ? `${fromTopicId}/` : ''}${commandMessageId}`;
+    }
+    const sendMessageResp = await (await postToTelegramApi(botToken, 'sendMessage', {
+      chat_id: fromChatId,
+      message_thread_id: fromTopicId,
+      text: `*[MESSAGE](${originMessageLink}) has been DELETED*\\.` +
+          `These three Message will be deleted after 1s automatically\\.` +
+          `\nOr You can delete the *[ORIGIN MESSAGE](${originMessageLink})*` +
+          ` and *[COMMAND MESSAGE](${commandMessageLink})*` +
+          ` and *\\[THIS MESSAGE\\]* for yourself\\.`,
+      parse_mode: "MarkdownV2",
+    })).json();
+    if (sendMessageResp.ok) {
+      await new Promise(resolve => setTimeout(resolve, 1000));
+      // delete origin message
+      await postToTelegramApi(botToken, 'deleteMessage', {
+        chat_id: fromChatId,
+        message_id: fromMessageId,
+      });
+      // delete command message
+      await postToTelegramApi(botToken, 'deleteMessage', {
+        chat_id: fromChatId,
+        message_id: commandMessageId,
+      });
+      await postToTelegramApi(botToken, 'deleteMessage', {
+        chat_id: fromChatId,
+        message_id: sendMessageResp.result.message_id,
+      });
+    }
+  } else {
+    await postToTelegramApi(botToken, 'sendMessage', {
+      chat_id: fromChatId,
+      message_thread_id: fromTopicId,
+      text: `*Message has been DELETED*\\.` +
+          `\nYou can delete the *\\[ORIGIN MESSAGE\\]*` +
+          ` and *\\[COMMAND MESSAGE\\]*` +
+          ` and *\\[THIS MESSAGE\\]* for yourself\\.` +
+          ` Limited by TG I can't do it for you, sorry\\.`,
+      parse_mode: "MarkdownV2",
+    });
   }
 }
 
